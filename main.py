@@ -8,27 +8,36 @@ from telegram import Bot
 TELEGRAM_BOT_TOKEN = "8818473462:AAG02pUpdJn0FsBzJabEVdOW7-UrFmMbx4w"
 TELEGRAM_CHAT_ID = -1003933274705
 
+# Депозит та ризик
+VIRTUAL_BALANCE = 100.0          # Уявний депозит (USDT)
+RISK_PER_TRADE = 0.01            # 1% від депозиту на угоду
+
 # Таймфрейми
-TIMEFRAME_REFERENCE = "1h"      # Опорний таймфрейм (Higher Timeframe)
-TIMEFRAME_EXECUTION = "5m"      # Таймфрейм для входу (Lower Timeframe)
-LOOKBACK_CANDLES = 30           # Кількість свічок для аналізу
+TIMEFRAME_REFERENCE = "1h"       # Опорний таймфрейм
+TIMEFRAME_EXECUTION = "5m"       # Таймфрейм для входу
+LOOKBACK_CANDLES = 30
 
 # CRT параметри
-MIN_WICK_PERCENT = 20.0         # Мінімальна тінь для маніпуляції (% від тіла)
-SWEEP_DEPTH = 0.05              # Глибина вимітання ліквідності (5% від ATR)
+MIN_WICK_PERCENT = 20.0
+SWEEP_DEPTH = 0.05
 
 # Ризик-менеджмент
-SL_BUFFER = 0.02                # 2% запас для стопу
-TP_RATIO = 1.5                  # Risk/Reward 1:1.5
+SL_BUFFER = 0.02
+TP_RATIO = 1.5
 
-CHECK_INTERVAL = 300            # Перевірка кожні 5 хвилин
+CHECK_INTERVAL = 60              # Перевірка кожну хвилину
 # =====================================================
 
 KYIV_TZ = timezone(timedelta(hours=3))
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
-tracked_setups = {}
+# Стан бота
+balance = VIRTUAL_BALANCE
+open_positions = {}
+closed_trades = []
 alerted = set()
+total_trades = 0
+winning_trades = 0
 
 def get_kyiv_time():
     return datetime.now(KYIV_TZ).strftime('%H:%M:%S')
@@ -59,12 +68,20 @@ async def get_klines(symbol, interval, limit=50):
             print(f"❌ Помилка {symbol}: {e}")
             return None
 
+async def get_current_price(symbol):
+    url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}"
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, timeout=10) as resp:
+                data = await resp.json()
+                return float(data['price'])
+        except:
+            return None
+
 def find_reference_candle(klines):
-    """Знаходить опорну свічку (Reference Candle) — найбільша за діапазоном"""
     if len(klines) < 2:
         return None
     
-    # Шукаємо свічку з найбільшим діапазоном серед останніх 10
     max_range = 0
     ref_index = -1
     
@@ -92,11 +109,9 @@ def find_reference_candle(klines):
     }
 
 def detect_manipulation(klines, ref_candle):
-    """Виявляє маніпуляційну свічку (Sweep & Flip)"""
     if not ref_candle or len(klines) < 3:
         return None
     
-    # Беремо останню свічку для перевірки
     last = {
         'high': klines['highs'][-1],
         'low': klines['lows'][-1],
@@ -104,19 +119,15 @@ def detect_manipulation(klines, ref_candle):
         'close': klines['closes'][-1]
     }
     
-    # Перевіряємо PUMP (булліш) — вимітання ліквідності вниз
     is_bullish_crt = False
     is_bearish_crt = False
     
-    # Булліш CRT: ціна вимітає ліквідність нижче Low, потім закривається всередині
     if last['low'] < ref_candle['low'] and last['close'] > ref_candle['low']:
-        # Перевіряємо тінь (маніпуляційна свічка)
-        if last['close'] > last['open']:  # Бича свічка
+        if last['close'] > last['open']:
             is_bullish_crt = True
     
-    # Ведмежий CRT: ціна вимітає ліквідність вище High, потім закривається всередині
     if last['high'] > ref_candle['high'] and last['close'] < ref_candle['high']:
-        if last['close'] < last['open']:  # Ведмежа свічка
+        if last['close'] < last['open']:
             is_bearish_crt = True
     
     if not is_bullish_crt and not is_bearish_crt:
@@ -131,7 +142,6 @@ def detect_manipulation(klines, ref_candle):
     }
 
 def calculate_atr(klines, period=14):
-    """Розраховує ATR"""
     if len(klines) < period + 1:
         return 0
     
@@ -145,52 +155,181 @@ def calculate_atr(klines, period=14):
     
     return sum(tr_values) / len(tr_values)
 
-async def send_crt_signal(symbol, setup, atr):
-    """Надсилає CRT сигнал у Telegram"""
-    emoji = "🟢" if setup['type'] == 'BULLISH' else "🔴"
-    direction = "БУЛЛІШ" if setup['type'] == 'BULLISH' else "ВЕДМЕЖИЙ"
-    direction_emoji = "📈" if setup['type'] == 'BULLISH' else "📉"
+def calculate_position_size(balance, entry, stop_loss, risk_percent=0.01):
+    """Розраховує розмір позиції на основі ризику"""
+    risk_amount = balance * risk_percent
+    risk_per_coin = abs(entry - stop_loss)
+    if risk_per_coin == 0:
+        return 0
+    position_size = risk_amount / risk_per_coin
+    return position_size
+
+async def open_virtual_position(symbol, setup, atr, current_balance):
+    """Відкриває уявну позицію"""
+    global balance, total_trades, winning_trades
     
-    # Розраховуємо рівні
     ref = setup['ref_candle']
     entry = setup['entry']
     
     if setup['type'] == 'BULLISH':
-        # Лонг: вхід після reclaim
         stop_loss = entry * (1 - SL_BUFFER - atr/entry * 0.5)
         take_profit = entry + (entry - stop_loss) * TP_RATIO
+        position_type = 'LONG'
     else:
-        # Шорт
         stop_loss = entry * (1 + SL_BUFFER + atr/entry * 0.5)
         take_profit = entry - (stop_loss - entry) * TP_RATIO
+        position_type = 'SHORT'
     
-    coin_name = symbol.replace('USDT', '')
+    # Розраховуємо розмір позиції
+    size = calculate_position_size(current_balance, entry, stop_loss)
+    
+    if size <= 0:
+        return None
+    
+    position = {
+        'symbol': symbol,
+        'type': position_type,
+        'entry': entry,
+        'stop_loss': stop_loss,
+        'take_profit': take_profit,
+        'size': size,
+        'open_time': time.time(),
+        'open_price': entry,
+        'risk_amount': current_balance * RISK_PER_TRADE,
+        'is_open': True
+    }
+    
+    return position
+
+async def close_virtual_position(position, current_price):
+    """Закриває уявну позицію та розраховує P&L"""
+    global balance, total_trades, winning_trades
+    
+    if position['type'] == 'LONG':
+        pnl = (current_price - position['entry']) * position['size']
+    else:
+        pnl = (position['entry'] - current_price) * position['size']
+    
+    # Розраховуємо відсоток
+    pnl_percent = (pnl / position['entry']) * 100 * position['size']
+    
+    # Оновлюємо баланс
+    balance += pnl
+    
+    # Статистика
+    total_trades += 1
+    if pnl > 0:
+        winning_trades += 1
+    
+    trade_result = {
+        'symbol': position['symbol'],
+        'type': position['type'],
+        'entry': position['entry'],
+        'exit': current_price,
+        'pnl': pnl,
+        'pnl_percent': pnl_percent,
+        'open_time': position['open_time'],
+        'close_time': time.time(),
+        'is_win': pnl > 0
+    }
+    
+    return trade_result
+
+async def monitor_positions():
+    """Моніторить відкриті позиції та закриває їх при досягненні TP/SL"""
+    global open_positions, balance, closed_trades
+    
+    for symbol, position in list(open_positions.items()):
+        if not position['is_open']:
+            continue
+        
+        current_price = await get_current_price(symbol)
+        if not current_price:
+            continue
+        
+        # Перевіряємо TP
+        if position['type'] == 'LONG':
+            if current_price >= position['take_profit']:
+                result = await close_virtual_position(position, current_price)
+                position['is_open'] = False
+                closed_trades.append(result)
+                await send_trade_result(result)
+                del open_positions[symbol]
+                continue
+            
+            # Перевіряємо SL
+            if current_price <= position['stop_loss']:
+                result = await close_virtual_position(position, current_price)
+                position['is_open'] = False
+                closed_trades.append(result)
+                await send_trade_result(result)
+                del open_positions[symbol]
+                continue
+        
+        else:  # SHORT
+            if current_price <= position['take_profit']:
+                result = await close_virtual_position(position, current_price)
+                position['is_open'] = False
+                closed_trades.append(result)
+                await send_trade_result(result)
+                del open_positions[symbol]
+                continue
+            
+            if current_price >= position['stop_loss']:
+                result = await close_virtual_position(position, current_price)
+                position['is_open'] = False
+                closed_trades.append(result)
+                await send_trade_result(result)
+                del open_positions[symbol]
+                continue
+
+async def send_trade_result(result):
+    """Надсилає результат угоди"""
+    emoji = "🟢" if result['is_win'] else "🔴"
+    status = "ПРИБУТОК ✅" if result['is_win'] else "ЗБИТОК ❌"
+    
+    coin_name = result['symbol'].replace('USDT', '')
+    pnl_text = f"+{result['pnl']:.2f}$" if result['pnl'] > 0 else f"{result['pnl']:.2f}$"
+    
+    # Тривалість угоди
+    duration = result['close_time'] - result['open_time']
+    if duration < 60:
+        duration_text = f"{int(duration)} сек."
+    elif duration < 3600:
+        duration_text = f"{int(duration/60)} хв."
+    else:
+        duration_text = f"{int(duration/3600)} год."
+    
+    # Загальна статистика
+    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
     
     message = (
-        f"{emoji} *{symbol}* ({coin_name}) — CRT СИГНАЛ {direction_emoji}\n"
+        f"{emoji} *{result['symbol']}* ({coin_name}) — УГОДА ЗАКРИТА {status}\n"
         f"\n"
-        f"📊 *Напрямок:* {direction} {direction_emoji}\n"
-        f"🕯 *Опорна свічка (Reference Candle):*\n"
-        f"   📈 High: {format_price(ref['high'])} USDT\n"
-        f"   📉 Low: {format_price(ref['low'])} USDT\n"
-        f"   📊 Діапазон: {format_price(ref['range'])} USDT\n"
+        f"📊 *Тип:* {result['type']}\n"
+        f"💰 *P&L:* {pnl_text}\n"
+        f"📈 *Зміна:* {result['pnl_percent']:.2f}%\n"
+        f"📊 *Вхід:* {format_price(result['entry'])} USDT\n"
+        f"📊 *Вихід:* {format_price(result['exit'])} USDT\n"
+        f"⏱ *Тривалість:* {duration_text}\n"
         f"\n"
-        f"🎯 *Вхід:* {format_price(entry)} USDT\n"
-        f"🛑 *Stop Loss:* {format_price(stop_loss)} USDT\n"
-        f"🏁 *Take Profit:* {format_price(take_profit)} USDT\n"
-        f"📊 *Risk/Reward:* 1:{TP_RATIO:.1f}\n"
+        f"📊 *Статистика:*\n"
+        f"   💰 Баланс: {balance:.2f} USDT\n"
+        f"   📈 Угоди: {total_trades} | ✅ Win rate: {win_rate:.1f}%\n"
         f"\n"
         f"🕐 *Час:* {get_kyiv_time()}"
     )
     
     try:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
-        print(f"✅ CRT СИГНАЛ: {symbol} {direction}")
+        print(f"✅ РЕЗУЛЬТАТ: {result['symbol']} {pnl_text}")
     except Exception as e:
         print(f"❌ Помилка відправки: {e}")
 
 async def scan_crt_setups():
     """Сканує всі монети на наявність CRT сигналів"""
+    global balance, open_positions
+    
     print(f"🔍 Сканування CRT... {get_kyiv_time()}")
     
     async with aiohttp.ClientSession() as session:
@@ -198,27 +337,29 @@ async def scan_crt_setups():
             async with session.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15) as resp:
                 tickers = await resp.json()
                 
-                # Фільтруємо монети з об'ємом
+                # Отримуємо ВСІ ф'ючерсні монети
                 symbols = []
                 for item in tickers:
                     symbol = item.get('symbol', '')
-                    if symbol.endswith('USDT') and symbol != 'BTCUSDT':
+                    if symbol.endswith('USDT'):
                         volume = float(item.get('quoteVolume', 0))
-                        if volume > 5_000_000:  # > $5M об'єму
+                        if volume > 1_000_000:
                             symbols.append(symbol)
                 
                 print(f"📊 Знайдено {len(symbols)} монет для аналізу")
                 
-                for symbol in symbols[:15]:  # Для тесту
+                for symbol in symbols:
+                    if symbol in open_positions:
+                        continue
+                    
                     if symbol in alerted:
                         continue
                     
-                    # Отримуємо свічки на Higher Timeframe (опорний)
+                    # Отримуємо свічки
                     klines_htf = await get_klines(symbol, TIMEFRAME_REFERENCE, LOOKBACK_CANDLES)
                     if not klines_htf:
                         continue
                     
-                    # Отримуємо свічки на Lower Timeframe (виконання)
                     klines_ltf = await get_klines(symbol, TIMEFRAME_EXECUTION, 30)
                     if not klines_ltf:
                         continue
@@ -228,32 +369,97 @@ async def scan_crt_setups():
                     if not ref_candle:
                         continue
                     
-                    # Шукаємо маніпуляцію на LTF
+                    # Шукаємо маніпуляцію
                     setup = detect_manipulation(klines_ltf, ref_candle)
                     if not setup:
                         continue
                     
-                    # Розраховуємо ATR для SL
+                    # Розраховуємо ATR
                     atr = calculate_atr(klines_ltf)
                     if atr == 0:
                         continue
                     
-                    # Надсилаємо сигнал
-                    await send_crt_signal(symbol, setup, atr)
+                    # Відкриваємо уявну позицію
+                    position = await open_virtual_position(symbol, setup, atr, balance)
+                    if not position:
+                        continue
+                    
+                    # Додаємо в відкриті позиції
+                    open_positions[symbol] = position
                     alerted.add(symbol)
-                    await asyncio.sleep(1)
+                    
+                    # Надсилаємо сигнал про відкриття
+                    await send_open_position_signal(symbol, position, setup)
+                    await asyncio.sleep(0.5)
                     
         except Exception as e:
             print(f"❌ Помилка сканування: {e}")
 
+async def send_open_position_signal(symbol, position, setup):
+    """Надсилає сигнал про відкриття позиції"""
+    emoji = "🟢" if position['type'] == 'LONG' else "🔴"
+    direction = "LONG (BUY)" if position['type'] == 'LONG' else "SHORT (SELL)"
+    direction_emoji = "📈" if position['type'] == 'LONG' else "📉"
+    
+    coin_name = symbol.replace('USDT', '')
+    
+    risk_amount = balance * RISK_PER_TRADE
+    
+    message = (
+        f"{emoji} *{symbol}* ({coin_name}) — CRT СИГНАЛ {direction_emoji}\n"
+        f"\n"
+        f"📊 *Напрямок:* {direction} {direction_emoji}\n"
+        f"🎯 *Вхід:* {format_price(position['entry'])} USDT\n"
+        f"🛑 *Stop Loss:* {format_price(position['stop_loss'])} USDT\n"
+        f"🏁 *Take Profit:* {format_price(position['take_profit'])} USDT\n"
+        f"📊 *Розмір позиції:* {position['size']:.4f} USDT\n"
+        f"💰 *Ризик:* {risk_amount:.2f} USDT (1% від депозиту)\n"
+        f"📊 *Баланс:* {balance:.2f} USDT\n"
+        f"\n"
+        f"🕐 *Час:* {get_kyiv_time()}"
+    )
+    
+    try:
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
+        print(f"✅ ВІДКРИТО: {symbol} {position['type']}")
+    except Exception as e:
+        print(f"❌ Помилка відправки: {e}")
+
+async def send_daily_summary():
+    """Надсилає щоденний звіт"""
+    global total_trades, winning_trades, balance
+    
+    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+    
+    message = (
+        f"📊 *ЩОДЕННИЙ ЗВІТ*\n"
+        f"\n"
+        f"💰 *Баланс:* {balance:.2f} USDT\n"
+        f"📈 *Зміна:* {((balance - VIRTUAL_BALANCE) / VIRTUAL_BALANCE * 100):.2f}%\n"
+        f"📊 *Угоди:* {total_trades}\n"
+        f"✅ *Прибуткових:* {winning_trades}\n"
+        f"📊 *Win Rate:* {win_rate:.1f}%\n"
+        f"\n"
+        f"🕐 *Час:* {get_kyiv_time()}"
+    )
+    
+    try:
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
+        print("✅ Денний звіт надіслано")
+    except Exception as e:
+        print(f"❌ Помилка відправки: {e}")
+
 async def main():
+    global balance, total_trades, winning_trades, open_positions
+    
     print("=" * 50)
-    print("🚀 CRT BOT — CANDLE RANGE THEORY STRATEGY")
+    print("🚀 CRT BOT — УЯВНА ТОРГІВЛЯ")
     print("=" * 50)
+    print(f"💰 Депозит: {VIRTUAL_BALANCE} USDT")
+    print(f"📊 Ризик на угоду: {RISK_PER_TRADE*100:.0f}%")
     print(f"📊 Опорний таймфрейм: {TIMEFRAME_REFERENCE}")
     print(f"📈 Таймфрейм виконання: {TIMEFRAME_EXECUTION}")
     print(f"🎯 Risk/Reward: 1:{TP_RATIO}")
-    print(f"🛑 Стоп: {SL_BUFFER*100:.0f}% + ATR")
     print(f"🔄 Перевірка кожні {CHECK_INTERVAL//60} хв")
     print("=" * 50)
     
@@ -261,6 +467,8 @@ async def main():
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=f"✅ *CRT BOT запущено!*\n"
+                 f"💰 Депозит: {VIRTUAL_BALANCE} USDT\n"
+                 f"📊 Ризик: {RISK_PER_TRADE*100:.0f}% на угоду\n"
                  f"📊 Опорний таймфрейм: {TIMEFRAME_REFERENCE}\n"
                  f"📈 Таймфрейм виконання: {TIMEFRAME_EXECUTION}\n"
                  f"🎯 Risk/Reward: 1:{TP_RATIO}\n"
@@ -271,9 +479,22 @@ async def main():
     except Exception as e:
         print(f"⚠️ Помилка: {e}")
     
+    last_daily_report = datetime.now().date()
+    
     while True:
         try:
+            # Скануємо нові сигнали
             await scan_crt_setups()
+            
+            # Моніторимо відкриті позиції
+            await monitor_positions()
+            
+            # Щоденний звіт
+            today = datetime.now().date()
+            if today != last_daily_report:
+                await send_daily_summary()
+                last_daily_report = today
+            
             await asyncio.sleep(CHECK_INTERVAL)
         except Exception as e:
             print(f"❌ Помилка в циклі: {e}")
