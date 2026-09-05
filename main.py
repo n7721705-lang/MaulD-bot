@@ -23,8 +23,10 @@ LOOKBACK_CANDLES = 30
 # CRT параметри
 SL_BUFFER = 0.02
 
-CHECK_INTERVAL = 15              # Аналіз кожні 15 секунд
-SCAN_LIMIT = 20                  # Максимум монет за одне сканування
+# Сканування - повний цикл за 2 хвилини
+CHECK_INTERVAL = 10              # Скануємо кожні 10 секунд
+SCAN_LIMIT = 120                 # 120 монет за раз (~714/120 ≈ 6 сканувань)
+# 6 сканувань × 10 секунд = 60 секунд ≈ 1 хвилина (з запасом ~2 хв)
 # =====================================================
 
 KYIV_TZ = timezone(timedelta(hours=3))
@@ -56,7 +58,7 @@ async def get_klines(symbol, interval, limit=50):
     url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(url, timeout=10) as resp:
+            async with session.get(url, timeout=8) as resp:
                 data = await resp.json()
                 if not data:
                     return None
@@ -340,7 +342,7 @@ async def scan_crt_setups():
     
     current_time = time.time()
     
-    # Перевіряємо, чи минуло 15 секунд
+    # Перевіряємо, чи минуло CHECK_INTERVAL секунд
     if current_time - last_scan_time < CHECK_INTERVAL:
         return
     
@@ -358,7 +360,7 @@ async def scan_crt_setups():
     # Оновлюємо індекс для наступного сканування
     symbol_index = end_idx % len(symbols)
     
-    print(f"🔍 Сканування {len(batch)} монет... {get_kyiv_time()} (індекс: {symbol_index})")
+    print(f"🔍 Сканування {len(batch)} монет... {get_kyiv_time()} (прогрес: {symbol_index}/{len(symbols)})")
     
     for symbol in batch:
         if symbol in open_positions:
@@ -396,7 +398,7 @@ async def scan_crt_setups():
         alerted.add(symbol)
         
         await send_open_position_signal(symbol, position, setup)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.2)
 
 async def send_open_position_signal(symbol, position, setup):
     emoji = "🟢" if position['type'] == 'LONG' else "🔴"
@@ -466,8 +468,9 @@ async def main():
     print(f"🎯 Risk/Reward: 1:{TP_RATIO:.0f}")
     print(f"📊 Опорний таймфрейм: {TIMEFRAME_REFERENCE}")
     print(f"📈 Таймфрейм виконання: {TIMEFRAME_EXECUTION}")
-    print(f"🔄 Аналіз кожні {CHECK_INTERVAL} секунд")
+    print(f"🔄 Сканування кожні {CHECK_INTERVAL} секунд")
     print(f"📊 Монет за сканування: {SCAN_LIMIT}")
+    print(f"⏱ Повний цикл: ~{int((714/SCAN_LIMIT)*CHECK_INTERVAL)} секунд")
     print("=" * 50)
     
     # Завантажуємо всі монети при старті
@@ -483,8 +486,9 @@ async def main():
                  f"🎯 Risk/Reward: 1:{TP_RATIO:.0f}\n"
                  f"📊 Опорний таймфрейм: {TIMEFRAME_REFERENCE}\n"
                  f"📈 Таймфрейм виконання: {TIMEFRAME_EXECUTION}\n"
-                 f"🔄 Аналіз кожні {CHECK_INTERVAL} секунд\n"
+                 f"🔄 Сканування кожні {CHECK_INTERVAL} секунд\n"
                  f"📊 Моніторинг {len(all_symbols)} ф'ючерсних монет\n"
+                 f"⏱ Повний цикл: ~{int((len(all_symbols)/SCAN_LIMIT)*CHECK_INTERVAL)} секунд\n"
                  f"🕐 Київ: {get_kyiv_time()}",
             parse_mode="Markdown"
         )
@@ -496,7 +500,7 @@ async def main():
     
     while True:
         try:
-            # Скануємо нові сигнали (кожні 15 секунд)
+            # Скануємо нові сигнали
             await scan_crt_setups()
             
             # Моніторимо відкриті позиції
@@ -508,7 +512,6 @@ async def main():
                 await send_daily_summary()
                 last_daily_report = today
             
-            # Якщо сканування не відбулося, чекаємо
             await asyncio.sleep(1)
             
         except Exception as e:
