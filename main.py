@@ -10,7 +10,7 @@ TELEGRAM_CHAT_ID = -1003933274705
 
 PUMP_THRESHOLD = 7.0          # Мінімальний рух (%)
 TIMEFRAME_MAIN = "15m"        # Основний таймфрейм
-TIMEFRAME_BOS = "5m"          # Таймфрейм для BOS
+TIMEFRAME_BOS = ["5m", "3m"]  # Таймфрейми для BOS
 FIB_LEVEL = 0.618             # Рівень входу
 CHECK_INTERVAL = 60           # Перевірка кожні 60 секунд
 LOOKBACK = 30                 # Свічок для аналізу
@@ -34,7 +34,6 @@ def format_price(price):
         return f"{price:.8f}"
 
 async def get_klines(symbol, interval, limit=50):
-    """Отримує свічки з Binance Futures"""
     url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
     async with aiohttp.ClientSession() as session:
         try:
@@ -53,41 +52,57 @@ async def get_klines(symbol, interval, limit=50):
             return None
 
 def find_swings(highs, lows, lookback=3):
-    """Знаходить свінг-хай та свінг-лоу"""
-    swings_high = []
-    swings_low = []
+    """Знаходить HH, HL, LH, LL"""
+    swings_high = []  # HH
+    swings_low = []   # LL
     
     for i in range(lookback, len(highs) - lookback):
+        # Перевіряємо HH (вищий максимум)
         if all(highs[i] > highs[i-j] for j in range(1, lookback+1)) and \
            all(highs[i] > highs[i+j] for j in range(1, lookback+1)):
-            swings_high.append((i, highs[i]))
+            swings_high.append({'index': i, 'price': highs[i], 'type': 'HH'})
         
+        # Перевіряємо LL (нижчий мінімум)
         if all(lows[i] < lows[i-j] for j in range(1, lookback+1)) and \
            all(lows[i] < lows[i+j] for j in range(1, lookback+1)):
-            swings_low.append((i, lows[i]))
+            swings_low.append({'index': i, 'price': lows[i], 'type': 'LL'})
     
     return swings_high, swings_low
 
-def detect_bos(highs, lows, swings_high, swings_low):
+def detect_bos(swings_high, swings_low, current_high, current_low):
     """Визначає BOS (злам структури)"""
     bos_signals = []
     
+    # BOS вгору: пробій попереднього HH
     if len(swings_high) >= 2:
-        last_hh = swings_high[-2]
-        if highs[-1] > last_hh[1]:
-            bos_signals.append({'type': 'BOS_UP', 'level': last_hh[1]})
+        last_hh = swings_high[-2]['price']
+        if current_high > last_hh:
+            bos_signals.append({
+                'type': 'BOS_UP',
+                'level': last_hh,
+                'label': '🚀 BOS ВГОРУ'
+            })
     
+    # BOS вниз: пробій попереднього LL
     if len(swings_low) >= 2:
-        last_ll = swings_low[-2]
-        if lows[-1] < last_ll[1]:
-            bos_signals.append({'type': 'BOS_DOWN', 'level': last_ll[1]})
+        last_ll = swings_low[-2]['price']
+        if current_low < last_ll:
+            bos_signals.append({
+                'type': 'BOS_DOWN',
+                'level': last_ll,
+                'label': '🔻 BOS ВНИЗ'
+            })
     
     return bos_signals
 
-def analyze_structure(highs, lows, closes):
-    """Аналізує структуру ринку"""
+def analyze_structure(klines):
+    """Повний аналіз структури"""
+    highs = klines['highs']
+    lows = klines['lows']
+    closes = klines['closes']
+    
     swings_high, swings_low = find_swings(highs, lows)
-    bos = detect_bos(highs, lows, swings_high, swings_low)
+    bos = detect_bos(swings_high, swings_low, highs[-1], lows[-1])
     
     return {
         'swings_high': swings_high,
@@ -95,8 +110,7 @@ def analyze_structure(highs, lows, closes):
         'bos': bos
     }
 
-async def send_signal(symbol, move, entry, sl, tp, start_price, current_price, elapsed, fib_levels, bos_signals):
-    """Надсилає сигнал у Telegram"""
+async def send_signal(symbol, move, entry, sl, tp, start_price, current_price, elapsed, fib_levels, structure, high, low, bos_tf):
     emoji = "🟢" if move > 0 else "🔴"
     action = "прибавила" if move > 0 else "упала"
     change_text = f"+{move:.2f}%" if move > 0 else f"{move:.2f}%"
@@ -111,32 +125,44 @@ async def send_signal(symbol, move, entry, sl, tp, start_price, current_price, e
     
     # BOS інформація
     bos_text = ""
-    if bos_signals:
-        bos_types = []
-        for b in bos_signals:
-            if b['type'] == 'BOS_UP':
-                bos_types.append('📈 BOS ВГОРУ')
-            else:
-                bos_types.append('📉 BOS ВНИЗ')
-        bos_text = "\n📊 *BOS:* " + ", ".join(bos_types)
+    if structure['bos']:
+        for b in structure['bos']:
+            bos_text += f"\n📊 *{b['label']}:* {format_price(b['level'])} USDT"
     
-    # Рівні Фібоначчі
+    # Свінги
+    swings_text = ""
+    if structure['swings_high']:
+        last_hh = structure['swings_high'][-1]
+        swings_text += f"\n📈 *HH:* {format_price(last_hh['price'])} USDT"
+    if structure['swings_low']:
+        last_ll = structure['swings_low'][-1]
+        swings_text += f"\n📉 *LL:* {format_price(last_ll['price'])} USDT"
+    
+    # Фібоначчі
     fib_text = ""
     for level, price in fib_levels.items():
         if level == FIB_LEVEL:
             fib_text += f"\n🎯 *{level:.1%}:* {format_price(price)} USDT ← ВХІД"
-        elif level in [0.0, 1.0]:
+        elif level == 0.0 or level == 1.0:
+            fib_text += f"\n🏁 *{level:.1%}:* {format_price(price)} USDT ← ТЕЙК"
+        else:
             fib_text += f"\n📊 *{level:.1%}:* {format_price(price)} USDT"
     
     message = (
         f"{emoji} *{symbol}* ({coin_name}) {action} на *{change_text}%* за последние {time_str}\n"
         f"\n"
-        f"📊 *Рівень входу (0.618):* {format_price(entry)} USDT\n"
-        f"🛑 *Stop Loss:* {format_price(sl)} USDT\n"
-        f"🎯 *Take Profit:* {format_price(tp)} USDT\n"
-        f"{bos_text}\n"
+        f"📈 *Імпульс:* {format_price(low)} → {format_price(high)} USDT\n"
+        f"📉 *Рух:* {format_price(start_price)} → {format_price(current_price)} USDT\n"
         f"\n"
-        f"📈 *Рух:* {format_price(start_price)} → {format_price(current_price)} USDT\n"
+        f"📊 *BOS таймфрейм:* {bos_tf}\n"
+        f"{bos_text}\n"
+        f"{swings_text}\n"
+        f"\n"
+        f"🎯 *Рівень входу (0.618):* {format_price(entry)} USDT\n"
+        f"🛑 *Stop Loss:* {format_price(sl)} USDT\n"
+        f"🏁 *Take Profit:* {format_price(tp)} USDT\n"
+        f"\n"
+        f"📊 *Рівні Фібоначчі:*\n"
         f"{fib_text}\n"
         f"\n"
         f"🕐 *Час:* {get_kyiv_time()}"
@@ -149,7 +175,6 @@ async def send_signal(symbol, move, entry, sl, tp, start_price, current_price, e
         print(f"❌ Помилка відправки: {e}")
 
 async def find_moves():
-    """Шукає різкі рухи на 15m таймфреймі"""
     global tracked_moves
     print(f"🔍 Пошук рухів... {get_kyiv_time()}")
     
@@ -190,7 +215,6 @@ async def find_moves():
             print(f"❌ Помилка: {e}")
 
 async def analyze_and_send():
-    """Аналізує рух та надсилає сигнал"""
     global tracked_moves, alerted
     
     for symbol, data in list(tracked_moves.items()):
@@ -204,21 +228,26 @@ async def analyze_and_send():
         current_price = data['current_price']
         elapsed = time.time() - data['time']
         
-        # Отримуємо свічки для аналізу BOS (5m)
-        klines_bos = await get_klines(symbol, TIMEFRAME_BOS, LOOKBACK)
-        if not klines_bos:
-            continue
+        # Шукаємо BOS на 5m або 3m (де швидше)
+        bos_found = None
+        structure = None
+        bos_tf = None
         
-        # Аналізуємо структуру
-        structure = analyze_structure(
-            klines_bos['highs'],
-            klines_bos['lows'],
-            klines_bos['closes']
-        )
+        for tf in TIMEFRAME_BOS:
+            klines_bos = await get_klines(symbol, tf, LOOKBACK)
+            if not klines_bos:
+                continue
+            
+            structure = analyze_structure(klines_bos)
+            
+            if structure['bos']:
+                bos_found = structure
+                bos_tf = tf
+                print(f"✅ {symbol}: BOS знайдено на {tf}")
+                break
         
-        # Перевіряємо BOS
-        if not structure['bos']:
-            print(f"⏳ {symbol}: Немає BOS, чекаємо...")
+        if not bos_found:
+            print(f"⏳ {symbol}: Немає BOS на 5m/3m, чекаємо...")
             continue
         
         # Розраховуємо Фібоначчі
@@ -235,20 +264,26 @@ async def analyze_and_send():
         
         entry = fib_levels[FIB_LEVEL]
         
-        # Розраховуємо SL та TP
-        if is_pump:
-            sl = low - (diff * 0.1)
-            tp = entry + (entry - sl) * 2
-        else:
-            sl = high + (diff * 0.1)
-            tp = entry - (sl - entry) * 2
+        # ========== СТРАТЕГІЯ MAULD ==========
+        # Вхід = 0.618
+        # Тейк = 0.0 (PUMP) або 1.0 (DUMP) — край імпульсу
+        # Стоп = за максимумом/мінімумом (як на зображенні)
+        
+        if is_pump:  # PUMP
+            tp = fib_levels[0.0]  # Тейк на початку імпульсу
+            sl = low  # Стоп за мінімумом (як на зображенні)
+        else:  # DUMP
+            tp = fib_levels[1.0]  # Тейк на початку імпульсу
+            sl = high  # Стоп за максимумом (як на зображенні)
         
         # Надсилаємо сигнал
         await send_signal(
             symbol, move, entry, sl, tp,
             start_price, current_price, elapsed,
             fib_levels,
-            structure['bos']
+            bos_found,
+            high, low,
+            bos_tf
         )
         
         data['processed'] = True
@@ -256,12 +291,13 @@ async def analyze_and_send():
 
 async def main():
     print("=" * 50)
-    print("🚀 MaulD BOT — PUMP/DUMP STRATEGY")
+    print("🚀 MaulD BOT — СТРАТЕГІЯ ЗА ВАШИМ ДОКУМЕНТОМ")
     print("=" * 50)
-    print(f"📊 Поріг руху: {PUMP_THRESHOLD}%")
-    print(f"⏱ Таймфрейм: {TIMEFRAME_MAIN}")
-    print(f"📈 BOS таймфрейм: {TIMEFRAME_BOS}")
-    print(f"🎯 Рівень Фібоначчі: {FIB_LEVEL:.1%}")
+    print(f"📊 Поріг руху: {PUMP_THRESHOLD}% на {TIMEFRAME_MAIN}")
+    print(f"📈 BOS таймфрейми: {', '.join(TIMEFRAME_BOS)}")
+    print(f"🎯 Вхід: {FIB_LEVEL:.1%} (відкат)")
+    print(f"🏁 Тейк: край імпульсу (0.0/1.0)")
+    print(f"🛑 Стоп: за максимумом/мінімумом")
     print(f"🔄 Перевірка кожні {CHECK_INTERVAL}с")
     print("=" * 50)
     
@@ -269,22 +305,23 @@ async def main():
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=f"✅ *MaulD BOT запущено!*\n"
-                 f"📊 Поріг: {PUMP_THRESHOLD}%\n"
-                 f"🎯 Рівень входу: {FIB_LEVEL:.1%}\n"
-                 f"📈 BOS таймфрейм: {TIMEFRAME_BOS}\n"
+                 f"📊 Поріг: {PUMP_THRESHOLD}% на {TIMEFRAME_MAIN}\n"
+                 f"📈 BOS: {', '.join(TIMEFRAME_BOS)}\n"
+                 f"🎯 Вхід: {FIB_LEVEL:.1%}\n"
+                 f"🏁 Тейк: край імпульсу\n"
+                 f"🛑 Стоп: за максимумом/мінімумом\n"
                  f"🕐 Київ: {get_kyiv_time()}",
             parse_mode="Markdown"
         )
         print("✅ Бот запущено!")
     except Exception as e:
-        print(f"⚠️ Помилка відправки тестового повідомлення: {e}")
+        print(f"⚠️ Помилка: {e}")
     
     while True:
         try:
             await find_moves()
             await analyze_and_send()
             
-            # Очищуємо старі рухи (> 2 годин)
             current_time = time.time()
             for symbol, data in list(tracked_moves.items()):
                 if current_time - data['time'] > 7200:
