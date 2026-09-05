@@ -12,20 +12,19 @@ TELEGRAM_CHAT_ID = -1003933274705
 VIRTUAL_BALANCE = 100.0          # Уявний депозит (USDT)
 RISK_PER_TRADE = 0.01            # 1% від депозиту на угоду
 
+# Risk/Reward
+TP_RATIO = 3.0                   # 1:3
+
 # Таймфрейми
 TIMEFRAME_REFERENCE = "1h"       # Опорний таймфрейм
 TIMEFRAME_EXECUTION = "5m"       # Таймфрейм для входу
 LOOKBACK_CANDLES = 30
 
 # CRT параметри
-MIN_WICK_PERCENT = 20.0
-SWEEP_DEPTH = 0.05
-
-# Ризик-менеджмент
 SL_BUFFER = 0.02
-TP_RATIO = 1.5
 
-CHECK_INTERVAL = 60              # Перевірка кожну хвилину
+CHECK_INTERVAL = 15              # Аналіз кожні 15 секунд
+SCAN_LIMIT = 20                  # Максимум монет за одне сканування
 # =====================================================
 
 KYIV_TZ = timezone(timedelta(hours=3))
@@ -38,6 +37,9 @@ closed_trades = []
 alerted = set()
 total_trades = 0
 winning_trades = 0
+symbol_index = 0
+all_symbols = []
+last_scan_time = 0
 
 def get_kyiv_time():
     return datetime.now(KYIV_TZ).strftime('%H:%M:%S')
@@ -54,7 +56,7 @@ async def get_klines(symbol, interval, limit=50):
     url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}"
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(url, timeout=15) as resp:
+            async with session.get(url, timeout=10) as resp:
                 data = await resp.json()
                 if not data:
                     return None
@@ -72,7 +74,7 @@ async def get_current_price(symbol):
     url = f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}"
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get(url, timeout=10) as resp:
+            async with session.get(url, timeout=5) as resp:
                 data = await resp.json()
                 return float(data['price'])
         except:
@@ -156,7 +158,6 @@ def calculate_atr(klines, period=14):
     return sum(tr_values) / len(tr_values)
 
 def calculate_position_size(balance, entry, stop_loss, risk_percent=0.01):
-    """Розраховує розмір позиції на основі ризику"""
     risk_amount = balance * risk_percent
     risk_per_coin = abs(entry - stop_loss)
     if risk_per_coin == 0:
@@ -165,9 +166,6 @@ def calculate_position_size(balance, entry, stop_loss, risk_percent=0.01):
     return position_size
 
 async def open_virtual_position(symbol, setup, atr, current_balance):
-    """Відкриває уявну позицію"""
-    global balance, total_trades, winning_trades
-    
     ref = setup['ref_candle']
     entry = setup['entry']
     
@@ -180,7 +178,6 @@ async def open_virtual_position(symbol, setup, atr, current_balance):
         take_profit = entry - (stop_loss - entry) * TP_RATIO
         position_type = 'SHORT'
     
-    # Розраховуємо розмір позиції
     size = calculate_position_size(current_balance, entry, stop_loss)
     
     if size <= 0:
@@ -202,7 +199,6 @@ async def open_virtual_position(symbol, setup, atr, current_balance):
     return position
 
 async def close_virtual_position(position, current_price):
-    """Закриває уявну позицію та розраховує P&L"""
     global balance, total_trades, winning_trades
     
     if position['type'] == 'LONG':
@@ -210,13 +206,10 @@ async def close_virtual_position(position, current_price):
     else:
         pnl = (position['entry'] - current_price) * position['size']
     
-    # Розраховуємо відсоток
-    pnl_percent = (pnl / position['entry']) * 100 * position['size']
+    pnl_percent = (pnl / (position['entry'] * position['size'])) * 100 if position['size'] > 0 else 0
     
-    # Оновлюємо баланс
     balance += pnl
     
-    # Статистика
     total_trades += 1
     if pnl > 0:
         winning_trades += 1
@@ -236,7 +229,6 @@ async def close_virtual_position(position, current_price):
     return trade_result
 
 async def monitor_positions():
-    """Моніторить відкриті позиції та закриває їх при досягненні TP/SL"""
     global open_positions, balance, closed_trades
     
     for symbol, position in list(open_positions.items()):
@@ -247,7 +239,6 @@ async def monitor_positions():
         if not current_price:
             continue
         
-        # Перевіряємо TP
         if position['type'] == 'LONG':
             if current_price >= position['take_profit']:
                 result = await close_virtual_position(position, current_price)
@@ -257,7 +248,6 @@ async def monitor_positions():
                 del open_positions[symbol]
                 continue
             
-            # Перевіряємо SL
             if current_price <= position['stop_loss']:
                 result = await close_virtual_position(position, current_price)
                 position['is_open'] = False
@@ -266,7 +256,7 @@ async def monitor_positions():
                 del open_positions[symbol]
                 continue
         
-        else:  # SHORT
+        else:
             if current_price <= position['take_profit']:
                 result = await close_virtual_position(position, current_price)
                 position['is_open'] = False
@@ -284,14 +274,12 @@ async def monitor_positions():
                 continue
 
 async def send_trade_result(result):
-    """Надсилає результат угоди"""
     emoji = "🟢" if result['is_win'] else "🔴"
     status = "ПРИБУТОК ✅" if result['is_win'] else "ЗБИТОК ❌"
     
     coin_name = result['symbol'].replace('USDT', '')
     pnl_text = f"+{result['pnl']:.2f}$" if result['pnl'] > 0 else f"{result['pnl']:.2f}$"
     
-    # Тривалість угоди
     duration = result['close_time'] - result['open_time']
     if duration < 60:
         duration_text = f"{int(duration)} сек."
@@ -300,7 +288,6 @@ async def send_trade_result(result):
     else:
         duration_text = f"{int(duration/3600)} год."
     
-    # Загальна статистика
     win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
     
     message = (
@@ -326,84 +313,101 @@ async def send_trade_result(result):
     except Exception as e:
         print(f"❌ Помилка відправки: {e}")
 
-async def scan_crt_setups():
-    """Сканує всі монети на наявність CRT сигналів"""
-    global balance, open_positions
+async def get_all_symbols():
+    global all_symbols
     
-    print(f"🔍 Сканування CRT... {get_kyiv_time()}")
+    if all_symbols:
+        return all_symbols
     
     async with aiohttp.ClientSession() as session:
         try:
-            async with session.get("https://fapi.binance.com/fapi/v1/ticker/24hr", timeout=15) as resp:
-                tickers = await resp.json()
-                
-                # Отримуємо ВСІ ф'ючерсні монети
+            async with session.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=15) as resp:
+                data = await resp.json()
                 symbols = []
-                for item in tickers:
+                for item in data.get('symbols', []):
                     symbol = item.get('symbol', '')
-                    if symbol.endswith('USDT'):
-                        volume = float(item.get('quoteVolume', 0))
-                        if volume > 1_000_000:
-                            symbols.append(symbol)
-                
-                print(f"📊 Знайдено {len(symbols)} монет для аналізу")
-                
-                for symbol in symbols:
-                    if symbol in open_positions:
-                        continue
-                    
-                    if symbol in alerted:
-                        continue
-                    
-                    # Отримуємо свічки
-                    klines_htf = await get_klines(symbol, TIMEFRAME_REFERENCE, LOOKBACK_CANDLES)
-                    if not klines_htf:
-                        continue
-                    
-                    klines_ltf = await get_klines(symbol, TIMEFRAME_EXECUTION, 30)
-                    if not klines_ltf:
-                        continue
-                    
-                    # Знаходимо опорну свічку
-                    ref_candle = find_reference_candle(klines_htf)
-                    if not ref_candle:
-                        continue
-                    
-                    # Шукаємо маніпуляцію
-                    setup = detect_manipulation(klines_ltf, ref_candle)
-                    if not setup:
-                        continue
-                    
-                    # Розраховуємо ATR
-                    atr = calculate_atr(klines_ltf)
-                    if atr == 0:
-                        continue
-                    
-                    # Відкриваємо уявну позицію
-                    position = await open_virtual_position(symbol, setup, atr, balance)
-                    if not position:
-                        continue
-                    
-                    # Додаємо в відкриті позиції
-                    open_positions[symbol] = position
-                    alerted.add(symbol)
-                    
-                    # Надсилаємо сигнал про відкриття
-                    await send_open_position_signal(symbol, position, setup)
-                    await asyncio.sleep(0.5)
-                    
+                    if symbol.endswith('USDT') and item.get('status') == 'TRADING':
+                        symbols.append(symbol)
+                all_symbols = symbols
+                print(f"📊 Завантажено {len(symbols)} ф'ючерсних монет")
+                return symbols
         except Exception as e:
-            print(f"❌ Помилка сканування: {e}")
+            print(f"❌ Помилка завантаження монет: {e}")
+            return []
+
+async def scan_crt_setups():
+    global balance, open_positions, alerted, symbol_index, last_scan_time
+    
+    current_time = time.time()
+    
+    # Перевіряємо, чи минуло 15 секунд
+    if current_time - last_scan_time < CHECK_INTERVAL:
+        return
+    
+    last_scan_time = current_time
+    
+    symbols = await get_all_symbols()
+    if not symbols:
+        return
+    
+    # Беремо наступні SCAN_LIMIT монет (циклічно)
+    start_idx = symbol_index
+    end_idx = min(symbol_index + SCAN_LIMIT, len(symbols))
+    batch = symbols[start_idx:end_idx]
+    
+    # Оновлюємо індекс для наступного сканування
+    symbol_index = end_idx % len(symbols)
+    
+    print(f"🔍 Сканування {len(batch)} монет... {get_kyiv_time()} (індекс: {symbol_index})")
+    
+    for symbol in batch:
+        if symbol in open_positions:
+            continue
+        
+        if symbol in alerted:
+            continue
+        
+        # Отримуємо свічки
+        klines_htf = await get_klines(symbol, TIMEFRAME_REFERENCE, LOOKBACK_CANDLES)
+        if not klines_htf:
+            continue
+        
+        klines_ltf = await get_klines(symbol, TIMEFRAME_EXECUTION, 30)
+        if not klines_ltf:
+            continue
+        
+        ref_candle = find_reference_candle(klines_htf)
+        if not ref_candle:
+            continue
+        
+        setup = detect_manipulation(klines_ltf, ref_candle)
+        if not setup:
+            continue
+        
+        atr = calculate_atr(klines_ltf)
+        if atr == 0:
+            continue
+        
+        position = await open_virtual_position(symbol, setup, atr, balance)
+        if not position:
+            continue
+        
+        open_positions[symbol] = position
+        alerted.add(symbol)
+        
+        await send_open_position_signal(symbol, position, setup)
+        await asyncio.sleep(0.3)
 
 async def send_open_position_signal(symbol, position, setup):
-    """Надсилає сигнал про відкриття позиції"""
     emoji = "🟢" if position['type'] == 'LONG' else "🔴"
     direction = "LONG (BUY)" if position['type'] == 'LONG' else "SHORT (SELL)"
     direction_emoji = "📈" if position['type'] == 'LONG' else "📉"
     
     coin_name = symbol.replace('USDT', '')
-    
     risk_amount = balance * RISK_PER_TRADE
+    
+    rr = TP_RATIO
+    pnl_target = risk_amount * rr
     
     message = (
         f"{emoji} *{symbol}* ({coin_name}) — CRT СИГНАЛ {direction_emoji}\n"
@@ -412,8 +416,10 @@ async def send_open_position_signal(symbol, position, setup):
         f"🎯 *Вхід:* {format_price(position['entry'])} USDT\n"
         f"🛑 *Stop Loss:* {format_price(position['stop_loss'])} USDT\n"
         f"🏁 *Take Profit:* {format_price(position['take_profit'])} USDT\n"
+        f"📊 *Risk/Reward:* 1:{rr:.0f}\n"
         f"📊 *Розмір позиції:* {position['size']:.4f} USDT\n"
         f"💰 *Ризик:* {risk_amount:.2f} USDT (1% від депозиту)\n"
+        f"🏆 *Потенційний прибуток:* {pnl_target:.2f} USDT\n"
         f"📊 *Баланс:* {balance:.2f} USDT\n"
         f"\n"
         f"🕐 *Час:* {get_kyiv_time()}"
@@ -421,12 +427,11 @@ async def send_open_position_signal(symbol, position, setup):
     
     try:
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
-        print(f"✅ ВІДКРИТО: {symbol} {position['type']}")
+        print(f"✅ ВІДКРИТО: {symbol} {position['type']} RR 1:{rr:.0f}")
     except Exception as e:
         print(f"❌ Помилка відправки: {e}")
 
 async def send_daily_summary():
-    """Надсилає щоденний звіт"""
     global total_trades, winning_trades, balance
     
     win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
@@ -439,6 +444,7 @@ async def send_daily_summary():
         f"📊 *Угоди:* {total_trades}\n"
         f"✅ *Прибуткових:* {winning_trades}\n"
         f"📊 *Win Rate:* {win_rate:.1f}%\n"
+        f"🎯 *Risk/Reward:* 1:{TP_RATIO:.0f}\n"
         f"\n"
         f"🕐 *Час:* {get_kyiv_time()}"
     )
@@ -450,18 +456,23 @@ async def send_daily_summary():
         print(f"❌ Помилка відправки: {e}")
 
 async def main():
-    global balance, total_trades, winning_trades, open_positions
+    global balance, total_trades, winning_trades, open_positions, all_symbols
     
     print("=" * 50)
-    print("🚀 CRT BOT — УЯВНА ТОРГІВЛЯ")
+    print("🚀 CRT BOT — УЯВНА ТОРГІВЛЯ (RR 1:3)")
     print("=" * 50)
     print(f"💰 Депозит: {VIRTUAL_BALANCE} USDT")
     print(f"📊 Ризик на угоду: {RISK_PER_TRADE*100:.0f}%")
+    print(f"🎯 Risk/Reward: 1:{TP_RATIO:.0f}")
     print(f"📊 Опорний таймфрейм: {TIMEFRAME_REFERENCE}")
     print(f"📈 Таймфрейм виконання: {TIMEFRAME_EXECUTION}")
-    print(f"🎯 Risk/Reward: 1:{TP_RATIO}")
-    print(f"🔄 Перевірка кожні {CHECK_INTERVAL//60} хв")
+    print(f"🔄 Аналіз кожні {CHECK_INTERVAL} секунд")
+    print(f"📊 Монет за сканування: {SCAN_LIMIT}")
     print("=" * 50)
+    
+    # Завантажуємо всі монети при старті
+    print("📡 Завантаження списку монет...")
+    all_symbols = await get_all_symbols()
     
     try:
         await bot.send_message(
@@ -469,9 +480,11 @@ async def main():
             text=f"✅ *CRT BOT запущено!*\n"
                  f"💰 Депозит: {VIRTUAL_BALANCE} USDT\n"
                  f"📊 Ризик: {RISK_PER_TRADE*100:.0f}% на угоду\n"
+                 f"🎯 Risk/Reward: 1:{TP_RATIO:.0f}\n"
                  f"📊 Опорний таймфрейм: {TIMEFRAME_REFERENCE}\n"
                  f"📈 Таймфрейм виконання: {TIMEFRAME_EXECUTION}\n"
-                 f"🎯 Risk/Reward: 1:{TP_RATIO}\n"
+                 f"🔄 Аналіз кожні {CHECK_INTERVAL} секунд\n"
+                 f"📊 Моніторинг {len(all_symbols)} ф'ючерсних монет\n"
                  f"🕐 Київ: {get_kyiv_time()}",
             parse_mode="Markdown"
         )
@@ -483,7 +496,7 @@ async def main():
     
     while True:
         try:
-            # Скануємо нові сигнали
+            # Скануємо нові сигнали (кожні 15 секунд)
             await scan_crt_setups()
             
             # Моніторимо відкриті позиції
@@ -495,10 +508,12 @@ async def main():
                 await send_daily_summary()
                 last_daily_report = today
             
-            await asyncio.sleep(CHECK_INTERVAL)
+            # Якщо сканування не відбулося, чекаємо
+            await asyncio.sleep(1)
+            
         except Exception as e:
             print(f"❌ Помилка в циклі: {e}")
-            await asyncio.sleep(60)
+            await asyncio.sleep(5)
 
 if __name__ == "__main__":
     asyncio.run(main())
