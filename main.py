@@ -1,14 +1,8 @@
 import asyncio
 import time
-import io
 import aiohttp
 from datetime import datetime, timezone, timedelta
 from telegram import Bot
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import numpy as np
 
 # ==================== НАЛАШТУВАННЯ ====================
 TELEGRAM_BOT_TOKEN = "8818473462:AAG02pUpdJn0FsBzJabEVdOW7-UrFmMbx4w"
@@ -101,81 +95,8 @@ def analyze_structure(highs, lows, closes):
         'bos': bos
     }
 
-def create_chart(symbol, klines, entry, sl, tp, fib_levels, bos_signals, start_price, current_price):
-    """Створює графік з розміткою"""
-    fig, ax = plt.subplots(figsize=(12, 6))
-    fig.patch.set_facecolor('#1a1a2e')
-    ax.set_facecolor('#16213e')
-    
-    times = klines['times']
-    opens = klines['opens']
-    highs = klines['highs']
-    lows = klines['lows']
-    closes = klines['closes']
-    
-    # Малюємо свічки
-    width = 0.6
-    for i, (t, o, h, l, c) in enumerate(zip(times, opens, highs, lows, closes)):
-        color = '#00ff88' if c >= o else '#ff6b6b'
-        ax.plot([t, t], [l, h], color=color, linewidth=1)
-        ax.bar(t, abs(c-o), bottom=min(o,c), width=width, color=color, alpha=0.7)
-    
-    # Рівні Фібоначчі
-    fib_colors = ['#ffffff', '#4a90d9', '#f5a623', '#7ed321', '#d0021b', '#9b59b6', '#ffffff']
-    for level, price in fib_levels.items():
-        if level == FIB_LEVEL:
-            ax.axhline(y=price, color='#00ff88', linestyle='-', linewidth=2)
-            ax.text(times[-1], price, f'ВХІД {FIB_LEVEL:.1%}', color='#00ff88', fontsize=9, ha='right', va='bottom')
-        else:
-            ax.axhline(y=price, color=fib_colors[int(level*10)%len(fib_colors)], linestyle='--', linewidth=1, alpha=0.5)
-            ax.text(times[-1], price, f'{level:.1%}', color='white', fontsize=7, ha='right', va='bottom')
-    
-    # Точка входу
-    ax.scatter(times[-1], entry, color='#00ff88', s=150, zorder=5, marker='^')
-    ax.annotate(f'ВХІД: {format_price(entry)}', xy=(times[-1], entry),
-                xytext=(times[-1], entry + (max(highs)-min(lows))*0.08),
-                color='#00ff88', fontsize=10, ha='center', fontweight='bold')
-    
-    # Stop Loss
-    ax.scatter(times[-1], sl, color='#ff6b6b', s=150, zorder=5, marker='v')
-    ax.annotate(f'SL: {format_price(sl)}', xy=(times[-1], sl),
-                xytext=(times[-1], sl - (max(highs)-min(lows))*0.08),
-                color='#ff6b6b', fontsize=10, ha='center', fontweight='bold')
-    
-    # Take Profit
-    ax.scatter(times[-1], tp, color='#ffd700', s=200, zorder=5, marker='*')
-    ax.annotate(f'TP: {format_price(tp)}', xy=(times[-1], tp),
-                xytext=(times[-1], tp + (max(highs)-min(lows))*0.08),
-                color='#ffd700', fontsize=10, ha='center', fontweight='bold')
-    
-    # BOS сигнали
-    for bos in bos_signals:
-        color = '#ff00ff' if bos['type'] == 'BOS_UP' else '#ff6b6b'
-        ax.axhline(y=bos['level'], color=color, linestyle=':', linewidth=2)
-        ax.text(times[0], bos['level'], bos['type'], color=color, fontsize=9, ha='left')
-    
-    # Заголовок
-    move = ((current_price - start_price) / start_price) * 100
-    ax.set_title(f'{symbol}  {move:+.2f}%  |  ВХІД: {format_price(entry)}  |  TP: {format_price(tp)}  |  SL: {format_price(sl)}',
-                 color='white', fontsize=12, fontweight='bold')
-    
-    ax.tick_params(colors='white')
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
-    ax.set_ylabel('Ціна (USDT)', color='white', fontsize=10)
-    ax.grid(True, alpha=0.2, color='white')
-    
-    plt.tight_layout()
-    
-    buf = io.BytesIO()
-    plt.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='#1a1a2e')
-    buf.seek(0)
-    plt.close()
-    
-    return buf
-
-async def send_signal(symbol, move, entry, sl, tp, start_price, current_price, elapsed, klines, fib_levels, bos_signals):
-    """Надсилає сигнал у Telegram з графіком"""
+async def send_signal(symbol, move, entry, sl, tp, start_price, current_price, elapsed, fib_levels, bos_signals):
+    """Надсилає сигнал у Telegram"""
     emoji = "🟢" if move > 0 else "🔴"
     action = "прибавила" if move > 0 else "упала"
     change_text = f"+{move:.2f}%" if move > 0 else f"{move:.2f}%"
@@ -188,28 +109,42 @@ async def send_signal(symbol, move, entry, sl, tp, start_price, current_price, e
         seconds = int(elapsed % 60)
         time_str = f"{minutes} мин. {seconds} сек."
     
+    # BOS інформація
+    bos_text = ""
+    if bos_signals:
+        bos_types = []
+        for b in bos_signals:
+            if b['type'] == 'BOS_UP':
+                bos_types.append('📈 BOS ВГОРУ')
+            else:
+                bos_types.append('📉 BOS ВНИЗ')
+        bos_text = "\n📊 *BOS:* " + ", ".join(bos_types)
+    
+    # Рівні Фібоначчі
+    fib_text = ""
+    for level, price in fib_levels.items():
+        if level == FIB_LEVEL:
+            fib_text += f"\n🎯 *{level:.1%}:* {format_price(price)} USDT ← ВХІД"
+        elif level in [0.0, 1.0]:
+            fib_text += f"\n📊 *{level:.1%}:* {format_price(price)} USDT"
+    
     message = (
         f"{emoji} *{symbol}* ({coin_name}) {action} на *{change_text}%* за последние {time_str}\n"
         f"\n"
-        f"📊 *Рівень входу:* {format_price(entry)} USDT\n"
+        f"📊 *Рівень входу (0.618):* {format_price(entry)} USDT\n"
         f"🛑 *Stop Loss:* {format_price(sl)} USDT\n"
         f"🎯 *Take Profit:* {format_price(tp)} USDT\n"
+        f"{bos_text}\n"
         f"\n"
-        f"📈 *Рух:* {format_price(start_price)} → {format_price(current_price)} USDT"
+        f"📈 *Рух:* {format_price(start_price)} → {format_price(current_price)} USDT\n"
+        f"{fib_text}\n"
+        f"\n"
+        f"🕐 *Час:* {get_kyiv_time()}"
     )
     
     try:
-        chart_buffer = create_chart(
-            symbol, klines, entry, sl, tp, fib_levels, bos_signals, start_price, current_price
-        )
-        
-        await bot.send_photo(
-            chat_id=TELEGRAM_CHAT_ID,
-            photo=chart_buffer,
-            caption=message,
-            parse_mode="Markdown"
-        )
-        print(f"✅ СИГНАЛ З ГРАФІКОМ: {symbol} {action} {move:.2f}%")
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown")
+        print(f"✅ СИГНАЛ: {symbol} {action} {move:.2f}%")
     except Exception as e:
         print(f"❌ Помилка відправки: {e}")
 
@@ -269,20 +204,24 @@ async def analyze_and_send():
         current_price = data['current_price']
         elapsed = time.time() - data['time']
         
+        # Отримуємо свічки для аналізу BOS (5m)
         klines_bos = await get_klines(symbol, TIMEFRAME_BOS, LOOKBACK)
         if not klines_bos:
             continue
         
+        # Аналізуємо структуру
         structure = analyze_structure(
             klines_bos['highs'],
             klines_bos['lows'],
             klines_bos['closes']
         )
         
+        # Перевіряємо BOS
         if not structure['bos']:
             print(f"⏳ {symbol}: Немає BOS, чекаємо...")
             continue
         
+        # Розраховуємо Фібоначчі
         diff = high - low
         is_pump = move > 0
         
@@ -296,6 +235,7 @@ async def analyze_and_send():
         
         entry = fib_levels[FIB_LEVEL]
         
+        # Розраховуємо SL та TP
         if is_pump:
             sl = low - (diff * 0.1)
             tp = entry + (entry - sl) * 2
@@ -303,10 +243,10 @@ async def analyze_and_send():
             sl = high + (diff * 0.1)
             tp = entry - (sl - entry) * 2
         
+        # Надсилаємо сигнал
         await send_signal(
             symbol, move, entry, sl, tp,
             start_price, current_price, elapsed,
-            data['klines_15m'],
             fib_levels,
             structure['bos']
         )
@@ -316,7 +256,7 @@ async def analyze_and_send():
 
 async def main():
     print("=" * 50)
-    print("🚀 MaulD BOT — PUMP/DUMP STRATEGY (Варіант 3)")
+    print("🚀 MaulD BOT — PUMP/DUMP STRATEGY")
     print("=" * 50)
     print(f"📊 Поріг руху: {PUMP_THRESHOLD}%")
     print(f"⏱ Таймфрейм: {TIMEFRAME_MAIN}")
@@ -328,7 +268,7 @@ async def main():
     try:
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
-            text=f"✅ *MaulD BOT (Варіант 3) запущено!*\n"
+            text=f"✅ *MaulD BOT запущено!*\n"
                  f"📊 Поріг: {PUMP_THRESHOLD}%\n"
                  f"🎯 Рівень входу: {FIB_LEVEL:.1%}\n"
                  f"📈 BOS таймфрейм: {TIMEFRAME_BOS}\n"
@@ -337,13 +277,14 @@ async def main():
         )
         print("✅ Бот запущено!")
     except Exception as e:
-        print(f"⚠️ Помилка: {e}")
+        print(f"⚠️ Помилка відправки тестового повідомлення: {e}")
     
     while True:
         try:
             await find_moves()
             await analyze_and_send()
             
+            # Очищуємо старі рухи (> 2 годин)
             current_time = time.time()
             for symbol, data in list(tracked_moves.items()):
                 if current_time - data['time'] > 7200:
